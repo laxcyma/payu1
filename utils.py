@@ -7,7 +7,7 @@ from fleio.billing.models.transaction import TransactionStatus
 from .conf import conf
 
 
-class PayUTransactionStatus:
+class RazorpayTransactionStatus:
     pending = 'PENDING'
     completed = 'COMPLETED'
     waiting_for_confirmation = 'WAITING_FOR_CONFIRMATION'
@@ -21,50 +21,39 @@ class PayUTransactionStatus:
     }
 
 
-class PayUUtils:
+class RazorpayUtils:
     @staticmethod
-    def validate_open_payu_signature(open_payu_signature, body) -> bool:
-        if not open_payu_signature:
-            return False
-        open_payu_signature = open_payu_signature.strip()
+    def validate_razorpay_signature(razorpay_signature, body) -> bool:
         try:
-            open_payu_signature_as_dict = dict(item.split("=") for item in open_payu_signature.split(';'))
+            # Calculate the HMAC-SHA256 signature of the request body using the webhook secret
+            calculated_signature = hmac.new(webhook_secret.encode('utf-8'), request_body, hashlib.sha256).hexdigest()
+
+            # Compare the calculated signature with the signature received in the request
+            return hmac.compare_digest(calculated_signature, razorpay_signature)
         except Exception as e:
-            del e  # unused
             return False
-        incoming_signature = open_payu_signature_as_dict.get('signature')
-        stripped = body.decode('utf-8').strip()
-        concatenated = stripped + conf.second_key
-        concatenated = concatenated.strip()
-        algorithm = open_payu_signature_as_dict.get('algorithm', 'md5')
-        expected_signature = hashlib.new(name=algorithm, data=concatenated.encode('utf-8')).hexdigest()
-        if expected_signature == incoming_signature:
-            return True
-        return False
+        
 
     @staticmethod
-    def get_payu_amount_in_fleio_amount(amount) -> float:
+    def get_razorpay_amount_in_fleio_amount(amount) -> float:
         if not isinstance(amount, int):
             amount = int(amount)
         return amount / 100
 
     @staticmethod
-    def get_fleio_amount_in_payu_amount(amount) -> float:
+    def get_fleio_amount_in_razorpay_amount(amount) -> int:
+        # Implement the conversion logic from your currency format to Razorpay amount (in paise)
         return int(amount * 100)
 
     @staticmethod
     def generate_external_order_id(invoice_id: str) -> str:
-        # we need to generate a unique string using the invoice id as extOrderId has to be unique and if someone
-        # does not complete payment, the order has to be re-created with a different extOrderId
-        # the first part before the dash is the invoice id and the rest is the random generated 16 characters string
-        random_string = ''.join(
-            random.choice(  # nosec B311
-                string.ascii_uppercase + string.ascii_lowercase + string.digits
-            ) for _ in range(16)
-        )
-        return '{}-{}'.format(invoice_id, random_string)
+        # Generate a unique string for the external order ID
+        random_string = ''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(16))
+        return f'{invoice_id}-{random_string}'		
 
     @staticmethod
     def get_invoice_id_from_external_order_id(external_order_id: str) -> str:
-        content = external_order_id.split('-')  # type: list
+        # Extract the invoice ID from the external order ID
+        content = external_order_id.split('-')
         return content[0]
+
