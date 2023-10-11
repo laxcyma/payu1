@@ -22,8 +22,8 @@ from fleio.billing.models.transaction import TransactionStatus
 from fleio.billing.serializers import AddTransactionSerializer
 from fleio.core.models import Client
 from .conf import conf
-from .utils import PayUTransactionStatus
-from .utils import PayUUtils
+from .utils import RazorpayTransactionStatus
+from .utils import RazorpayUtils
 
 from django.http import JsonResponse
 
