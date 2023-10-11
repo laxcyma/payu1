@@ -209,29 +209,122 @@ def callback(request):
         client.utility.verify_webhook_signature(request.body.decode(), signature, razorpay_webhook_secret)
     except ValueError:
         return JsonResponse({'detail': 'Invalid Razorpay signature'}, status=400)
-
+		
+    invoice_id = RazorpayUtils.get_invoice_id_from_external_order_id(external_order_id=order_details.get('extOrderId'))
     # Extract relevant data from the payload
     order_id = payload.get('payload').get('payment').get('entity').get('id')
-    invoice_id = "YOUR_INVOICE_ID_LOGIC"  # Replace with your logic to map Razorpay order to your invoice
+    invoice_id = invoice_id 
 
     # Handle the different Razorpay payment statuses
     payment_status = payload.get('payload').get('payment').get('entity').get('status')
     total_amount = Decimal(payload.get('payload').get('payment').get('entity').get('amount')) / 100  # Convert back to your currency format
-
+	
+	
+	
+	
     if payment_status == 'captured':
-        # Process a successful payment
-        # Update your invoice and transaction status accordingly
-        # You might want to create a new transaction or mark an existing one as successful
-        # Mark the invoice as paid
-        # Perform necessary business logic
-        return JsonResponse({'detail': 'Payment captured'}, status=200)
+        #---------
+		existing_transaction = Transaction.objects.filter(
+        external_id=external_id,
+        gateway=gateway,
+        refunded_transaction__isnull=True).first()
+	
+		if existing_transaction:
+			# Update the transaction status and mark invoice as paid (still needs capture if automatic capture is not
+			# enabled in Razorpay) if client successfully made the payment
+			existing_transaction.status = RazorpayTransactionStatus.to_transaction_model_status.get(transaction_status)
+			existing_transaction.save(update_fields=['status'])
+			if (transaction_status == RazorpayTransactionStatus.waiting_for_confirmation or
+					(transaction_status == RazorpayTransactionStatus.completed and existing_transaction.invoice and
+					 existing_transaction.invoice.is_unpaid())):
+				activity_helper.start_generic_activity(
+					category_name='razorpay', activity_class='razorpay payment',
+					invoice_id=invoice_id
+				)
+				invoice_add_payment(
+					invoice_id=invoice_id, amount=total_amount,
+					currency_code=order_details.get('currencyCode'), transaction_id=existing_transaction.id,
+				)
+				activity_helper.end_activity()
+				return Response({'detail': 'Ok'})
+			elif transaction_status == RazorpayTransactionStatus.pending:
+				serializer_data = {
+					'invoice': invoice_id,
+					'external_id': external_id,
+					'amount': total_amount,
+					'currency': order_details.get('currencyCode'),
+					'gateway': gateway.pk,
+					'fee': gateway.get_fee(amount=decimal.Decimal(total_amount)),
+					'date_initiated': order_details.get('orderCreateDate'),
+					'extra': {},
+					'status': RazorpayTransactionStatus.to_transaction_model_status.get(transaction_status)
+				}
+			add_transaction_serializer = AddTransactionSerializer(data=serializer_data)
+			if add_transaction_serializer.is_valid(raise_exception=False):
+				add_transaction_serializer.save()
+			else:
+				LOG.error('Razorpay transaction error: {}'.format(add_transaction_serializer.errors))
+				raise gateway_exceptions.InvoicePaymentException('Transaction error', invoice_id=invoice_id)
+			
+			#--------
+		return JsonResponse({'detail': 'Payment captured'}, status=200)
 
     elif payment_status == 'failed':
-        # Handle a failed payment
-        # Implement your logic to deal with failed payments, e.g., sending notifications or flagging the invoice
-        # You may want to create a new transaction or update an existing one
+        # process refund for pre-auth transaction
+        existing_transaction = Transaction.objects.filter(
+            external_id=external_id,
+            gateway=gateway,
+            refunded_transaction__isnull=True
+        ).first()
+        if not existing_transaction:
+            raise gateway_exceptions.GatewayException(
+                'Could not process cancellation notification because there is no transaction to refund')
+			new_refund_transaction = {
+				'invoice': invoice_id,
+				'external_id': external_id,
+				'amount': str(total_amount),
+				'currency': order_details.get('currencyCode'),
+				'gateway': gateway.pk,
+				'fee': gateway.get_fee(amount=decimal.Decimal(total_amount)),
+				'date_initiated': utcnow(),
+				'extra': {},
+				'refunded_transaction': existing_transaction.pk,
+				'status': TransactionStatus.REFUNDED
+			}
+			transaction_serializer = AddTransactionSerializer(data=new_refund_transaction)
+			activity_helper.start_generic_activity(
+				category_name='razorpay', activity_class='razorpay payment refund',
+				invoice_id=existing_transaction.invoice.id
+			)
+
+			try:
+				with django_db_transaction.atomic():
+					transaction_serializer.is_valid(raise_exception=True)
+					new_transaction = transaction_serializer.save()
+					invoice_refund_payment(
+						transaction_id=existing_transaction.id,
+						amount=total_amount,
+						to_client_credit=False,
+						new_transaction_id=new_transaction.pk
+					)
+
+				activity_helper.end_activity()
+				return Response({'detail': 'Ok'})
+
+			except Exception as e:
+				error_message = 'Failed to mark Payu transaction {} as refunded: {}'.format(
+					existing_transaction.external_id, e
+				)
+				LOG.error(error_message)
+				activity_helper.end_activity(failed=True, details=error_message)
+				raise gateway_exceptions.GatewayException(
+					_('Failed to mark transaction as refunded.')
+				)
         return JsonResponse({'detail': 'Payment failed'}, status=200)
 
     # Add more conditions for other payment statuses as needed
     else:
         return JsonResponse({'detail': 'Unknown payment status'}, status=200)
+		
+		
+		
